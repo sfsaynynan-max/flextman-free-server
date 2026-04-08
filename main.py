@@ -1,6 +1,7 @@
 import os
 import httpx
 import tempfile
+import threading
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
@@ -16,14 +17,30 @@ app.add_middleware(
 
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY")
 
-print("Loading Whisper model...")
-model = WhisperModel(
-    "large-v3-turbo",
-    device="cpu",
-    compute_type="int8",
-    download_root="/tmp/whisper_models"
-)
-print("Model loaded!")
+# النموذج يُحمّل مرة واحدة فقط
+_model = None
+_model_lock = threading.Lock()
+
+def get_model():
+    global _model
+    if _model is None:
+        with _model_lock:
+            if _model is None:
+                print("Loading Whisper model...")
+                _model = WhisperModel(
+                    "turbo",
+                    device="cpu",
+                    compute_type="int8",
+                    download_root="/tmp/whisper_models",
+                    num_workers=1,
+                )
+                print("Whisper model loaded!")
+    return _model
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "flextman-free-api"}
 
 
 @app.post("/process-free")
@@ -32,22 +49,28 @@ async def process_free(
     target_language: str = Form("Arabic"),
 ):
     try:
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=".wav"
-        ) as tmp:
+        # حفظ الملف مؤقتاً
+        suffix = ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
 
-        segments_gen, info = model.transcribe(
+        # تفريغ
+        whisper = get_model()
+        segments_gen, info = whisper.transcribe(
             tmp_path,
             language=None,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
             word_timestamps=False,
+            beam_size=3,
         )
 
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
         segments = []
         for seg in segments_gen:
@@ -66,6 +89,7 @@ async def process_free(
                 detail="No speech detected in audio"
             )
 
+        # ترجمة
         texts = [s["text"] for s in segments]
         combined = "\n---\n".join(texts)
 
@@ -115,21 +139,3 @@ async def process_free(
                 "original": seg["text"],
                 "translated": (
                     translated_parts[i]
-                    if i < len(translated_parts)
-                    else seg["text"]
-                ),
-            })
-
-        return {
-            "success": True,
-            "segments": final_segments,
-            "detected_language": info.language,
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "flextman-free-api"}
