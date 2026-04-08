@@ -15,85 +15,148 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+ASSEMBLYAI_KEY = os.environ.get("ASSEMBLYAI_KEY")
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY")
-
-# النموذج يُحمّل مرة واحدة فقط
-_model = None
-_model_lock = threading.Lock()
-
-def get_model():
-    global _model
-    if _model is None:
-        with _model_lock:
-            if _model is None:
-                print("Loading Whisper model...")
-                _model = WhisperModel(
-                    "turbo",
-                    device="cpu",
-                    compute_type="int8",
-                    download_root="/tmp/whisper_models",
-                    num_workers=1,
-                )
-                print("Whisper model loaded!")
-    return _model
+ASSEMBLYAI_BASE = "https://api.assemblyai.com"
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "flextman-free-api"}
+async def upload_file(file_bytes: bytes) -> str:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{ASSEMBLYAI_BASE}/v2/upload",
+            headers={"authorization": ASSEMBLYAI_KEY},
+            content=file_bytes,
+            timeout=120,
+        )
+        return response.json()["upload_url"]
 
 
-@app.post("/process-free")
-async def process_free(
+async def transcribe(upload_url: str) -> dict:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{ASSEMBLYAI_BASE}/v2/transcript",
+            headers={"authorization": ASSEMBLYAI_KEY},
+            json={
+                "audio_url": upload_url,
+                "language_detection": True,
+                "punctuate": True,
+                "speech_models": ["universal-3-pro", "universal-2"],
+            },
+            timeout=30,
+        )
+        transcript_id = response.json()["id"]
+
+        import asyncio
+        while True:
+            await asyncio.sleep(3)
+            poll = await client.get(
+                f"{ASSEMBLYAI_BASE}/v2/transcript/{transcript_id}",
+                headers={"authorization": ASSEMBLYAI_KEY},
+                timeout=30,
+            )
+            data = poll.json()
+            if data["status"] == "completed":
+                return data
+            elif data["status"] == "error":
+                raise Exception(f"Transcription error: {data['error']}")
+
+
+@app.post("/process")
+async def process(
     file: UploadFile = File(...),
-    target_language: str = Form("Arabic"),
+    target_language: str = Form("English"),
+    is_premium: str = Form("false")
 ):
     try:
-        # حفظ الملف مؤقتاً
-        suffix = ".wav"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+        file_bytes = await file.read()
+        upload_url = await upload_file(file_bytes)
+        transcript_data = await transcribe(upload_url)
+        words = transcript_data.get("words", [])
 
-        # تفريغ
-        whisper = get_model()
-        segments_gen, info = whisper.transcribe(
-            tmp_path,
-            language=None,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            word_timestamps=False,
-            beam_size=3,
-        )
-
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        if not words:
+            raise HTTPException(status_code=500, detail="No words found in audio")
 
         segments = []
-        for seg in segments_gen:
-            text = seg.text.strip()
-            if text:
+        chunk = []
+        chunk_start = None
+        chunk_end = None
+
+        for i, word in enumerate(words):
+            if chunk_start is None:
+                chunk_start = word["start"]
+            chunk.append(word["text"])
+            chunk_end = word["end"]
+            if len(chunk) >= 8 or i == len(words) - 1:
                 segments.append({
                     "index": len(segments) + 1,
-                    "start": int(seg.start * 1000),
-                    "end": int(seg.end * 1000),
-                    "text": text,
+                    "start": chunk_start,
+                    "end": chunk_end,
+                    "text": " ".join(chunk)
                 })
+                chunk = []
+                chunk_start = None
 
-        if not segments:
-            raise HTTPException(
-                status_code=400,
-                detail="No speech detected in audio"
-            )
-
-        # ترجمة
         texts = [s["text"] for s in segments]
         combined = "\n---\n".join(texts)
 
+        translated_parts = []
         async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(
+                "https://api.deepseek.com/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": f"You are a professional subtitle translator. Translate the following subtitle segments to {target_language}. Each segment is separated by ---. Return ONLY the translated segments separated by ---. Keep the same number of segments. Keep translations natural and concise."
+                        },
+                        {"role": "user", "content": combined}
+                    ],
+                    "temperature": 0.3
+                }
+            )
+
+        result = response.json()
+        if "choices" not in result:
+            raise Exception(f"DeepSeek error: {result}")
+
+        translated_text = result["choices"][0]["message"]["content"]
+        translated_parts = [p.strip() for p in translated_text.split("\n---\n")]
+
+        final_segments = []
+        for i, seg in enumerate(segments):
+            final_segments.append({
+                "index": seg["index"],
+                "start": seg["start"],
+                "end": seg["end"],
+                "original": seg["text"],
+                "translated": translated_parts[i] if i < len(translated_parts) else seg["text"]
+            })
+
+        return {
+            "success": True,
+            "segments": final_segments,
+            "detected_language": transcript_data.get("language_code", "unknown")
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/translate-only")
+async def translate_only(request: dict):
+    try:
+        text = request.get("text", "")
+        target_language = request.get("target_language", "Arabic")
+
+        if not text:
+            raise HTTPException(status_code=400, detail="No text provided")
+
+        async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 "https://api.deepseek.com/chat/completions",
                 headers={
@@ -110,32 +173,26 @@ async def process_free(
                                 f"Translate the following subtitle segments to {target_language}. "
                                 f"Each segment is separated by ---. "
                                 f"Return ONLY the translated segments separated by ---. "
-                                f"Keep the same number of segments. "
-                                f"Keep translations natural and concise."
+                                f"Keep the same number of segments."
                             ),
                         },
-                        {"role": "user", "content": combined},
+                        {"role": "user", "content": text},
                     ],
                     "temperature": 0.3,
                 },
             )
 
         result = response.json()
-
         if "choices" not in result:
             raise Exception(f"DeepSeek error: {result}")
 
-        translated_text = result["choices"][0]["message"]["content"]
-        translated_parts = [
-            p.strip() for p in translated_text.split("\n---\n")
-        ]
+        translated = result["choices"][0]["message"]["content"]
+        return {"success": True, "translated": translated}
 
-        final_segments = []
-        for i, seg in enumerate(segments):
-            final_segments.append({
-                "index": seg["index"],
-                "start": seg["start"],
-                "end": seg["end"],
-                "original": seg["text"],
-                "translated": (
-                    translated_parts[i]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "flextman-api"}
