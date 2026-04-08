@@ -1,9 +1,9 @@
 import os
 import httpx
 import tempfile
+import whisper
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from faster_whisper import WhisperModel
 
 app = FastAPI()
 
@@ -18,12 +18,7 @@ DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY")
 
 # تحميل النموذج مرة واحدة عند بدء السيرفر
 print("Loading Whisper model...")
-model = WhisperModel(
-    "large-v3-turbo",
-    device="cpu",
-    compute_type="int8",
-    download_root="/tmp/whisper_models"
-)
+model = whisper.load_model("large-v3", download_root="/tmp/whisper_models")
 print("Model loaded!")
 
 
@@ -41,28 +36,25 @@ async def process_free(
             tmp.write(content)
             tmp_path = tmp.name
 
-        # تفريغ بـ faster-whisper
-        segments_gen, info = model.transcribe(
+        # تفريغ بـ openai-whisper
+        result_raw = model.transcribe(
             tmp_path,
             language=None,  # كشف تلقائي
-            vad_filter=True,  # تخطي الصمت تلقائياً
-            vad_parameters=dict(
-                min_silence_duration_ms=500
-            ),
             word_timestamps=False,
+            fp16=False,
         )
 
         os.unlink(tmp_path)
 
         # تجميع segments
         segments = []
-        for seg in segments_gen:
-            text = seg.text.strip()
+        for seg in result_raw["segments"]:
+            text = seg["text"].strip()
             if text:
                 segments.append({
                     "index": len(segments) + 1,
-                    "start": int(seg.start * 1000),
-                    "end": int(seg.end * 1000),
+                    "start": int(seg["start"] * 1000),
+                    "end": int(seg["end"] * 1000),
                     "text": text,
                 })
 
@@ -131,7 +123,7 @@ async def process_free(
         return {
             "success": True,
             "segments": final_segments,
-            "detected_language": info.language,
+            "detected_language": result_raw["language"],
         }
 
     except Exception as e:
