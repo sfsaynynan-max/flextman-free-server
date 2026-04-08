@@ -1,10 +1,8 @@
 import os
 import httpx
 import tempfile
-import threading
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from faster_whisper import WhisperModel
 
 app = FastAPI()
 
