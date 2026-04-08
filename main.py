@@ -1,9 +1,9 @@
 import os
 import httpx
 import tempfile
-from faster_whisper import WhisperModel
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from faster_whisper import WhisperModel
 
 app = FastAPI()
 
@@ -16,9 +16,13 @@ app.add_middleware(
 
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY")
 
-# تحميل النموذج مرة واحدة عند بدء السيرفر
 print("Loading Whisper model...")
-model = whisper.load_model("large-v3", download_root="/tmp/whisper_models")
+model = WhisperModel(
+    "large-v3-turbo",
+    device="cpu",
+    compute_type="int8",
+    download_root="/tmp/whisper_models"
+)
 print("Model loaded!")
 
 
@@ -28,7 +32,6 @@ async def process_free(
     target_language: str = Form("Arabic"),
 ):
     try:
-        # حفظ الملف مؤقتاً
         with tempfile.NamedTemporaryFile(
             delete=False, suffix=".wav"
         ) as tmp:
@@ -36,25 +39,24 @@ async def process_free(
             tmp.write(content)
             tmp_path = tmp.name
 
-        # تفريغ بـ openai-whisper
-        result_raw = model.transcribe(
+        segments_gen, info = model.transcribe(
             tmp_path,
-            language=None,  # كشف تلقائي
+            language=None,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
             word_timestamps=False,
-            fp16=False,
         )
 
         os.unlink(tmp_path)
 
-        # تجميع segments
         segments = []
-        for seg in result_raw["segments"]:
-            text = seg["text"].strip()
+        for seg in segments_gen:
+            text = seg.text.strip()
             if text:
                 segments.append({
                     "index": len(segments) + 1,
-                    "start": int(seg["start"] * 1000),
-                    "end": int(seg["end"] * 1000),
+                    "start": int(seg.start * 1000),
+                    "end": int(seg.end * 1000),
                     "text": text,
                 })
 
@@ -64,7 +66,6 @@ async def process_free(
                 detail="No speech detected in audio"
             )
 
-        # ترجمة بـ DeepSeek
         texts = [s["text"] for s in segments]
         combined = "\n---\n".join(texts)
 
@@ -105,7 +106,6 @@ async def process_free(
             p.strip() for p in translated_text.split("\n---\n")
         ]
 
-        # دمج النتائج
         final_segments = []
         for i, seg in enumerate(segments):
             final_segments.append({
@@ -123,7 +123,7 @@ async def process_free(
         return {
             "success": True,
             "segments": final_segments,
-            "detected_language": result_raw["language"],
+            "detected_language": info.language,
         }
 
     except Exception as e:
